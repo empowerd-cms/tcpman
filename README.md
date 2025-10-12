@@ -74,3 +74,21 @@ source ~/.bashrc
 
 Now you can run `tcpman` from anywhere.
 
+Perfect — here’s a short, clear way to add that advice:
+
+---
+
+### ⚠️ Note when using it for unknown paths/servers
+
+`tcpman` waits for the **last byte after the first byte is received**.
+If the server never sends any data (e.g., for an unknown path), the client will hang indefinitely.
+To protect against this, you can wrap the command with a shell timeout, for example:
+
+```bash
+timeout 9s tcpman tcp://localhost:6001/unknown # automatically quits after 9s
+```
+
+This ensures the client exits even if no bytes are ever sent.
+
+---
+
