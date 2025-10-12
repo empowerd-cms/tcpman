@@ -66,7 +66,7 @@ This makes it a deterministic, opinionated client for automation and testing.
 ### 📂 Install and add to PATH
 
 ```bash
-git clone https://github.com/empowerd/tcpman
+git clone https://github.com/empowerd-cms/tcpman
 cd tcpman
 echo 'export PATH="$PWD:$PATH"' >> ~/.bashrc
 source ~/.bashrc
