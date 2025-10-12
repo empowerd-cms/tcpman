@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HOSTPORT=""
+DATA="{}"
+IDLE_SECONDS=0.1  # quit if no byte arrives for this many seconds after first byte
+
+# --- Parse args ---
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d|--data)
+      DATA="$2"
+      shift 2
+      ;;
+    *)
+      HOSTPORT="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$HOSTPORT" ]]; then
+  echo "Usage: $0 <tcp://host:port[/path]|host:port[/path]> [-d '<json-data>']" >&2
+  exit 1
+fi
+
+# --- Normalize URL and split optional path ---
+HOSTPORT="${HOSTPORT#tcp://}"
+HOSTPORT_NOPATH="${HOSTPORT%%/*}"
+PATH_PART=""
+if [[ "$HOSTPORT" != "$HOSTPORT_NOPATH" ]]; then
+  PATH_PART="/${HOSTPORT#${HOSTPORT_NOPATH}/}"
+fi
+
+# --- Parse host and port ---
+if [[ "$HOSTPORT_NOPATH" == *:* ]]; then
+  HOST="${HOSTPORT_NOPATH%%:*}"
+  PORT="${HOSTPORT_NOPATH##*:}"
+else
+  echo "Error: please specify host:port" >&2
+  exit 1
+fi
+
+# --- Validate JSON ---
+command -v jq >/dev/null 2>&1 || { echo "jq required"; exit 1; }
+if ! DATA=$(jq -c . <<<"$DATA" 2>/dev/null); then
+  echo "Error: invalid JSON" >&2
+  exit 1
+fi
+
+# --- Inject optional path into JSON ---
+if [[ -n "$PATH_PART" ]]; then
+  if ! jq -e 'has("path")' <<<"$DATA" >/dev/null 2>&1; then
+    DATA=$(jq --arg p "$PATH_PART" '. + {path:$p}' <<<"$DATA")
+  fi
+fi
+
+# --- Open TCP connection ---
+exec 3<>/dev/tcp/"$HOST"/"$PORT"
+
+# Send JSON
+printf '%s' "$DATA" >&3
+
+# --- Read in chunks and monitor idle ---
+first_byte_received=false
+last_time=0
+CHUNK_SIZE=512
+
+while true; do
+  if ! $first_byte_received; then
+    # Wait indefinitely for the first data
+    if IFS= read -r -N "$CHUNK_SIZE" chunk <&3; then
+      [[ -n "$chunk" ]] && printf '%s' "$chunk"
+      first_byte_received=true
+      last_time="$EPOCHREALTIME"
+    else
+      # read failed (EOF) but may have printed partial data
+      [[ -n "$chunk" ]] && printf '%s' "$chunk"
+      break
+    fi
+  else
+    # Small timeout for idle detection
+    if IFS= read -r -N "$CHUNK_SIZE" -t 0.1 chunk <&3; then
+      [[ -n "$chunk" ]] && printf '%s' "$chunk"
+      last_time="$EPOCHREALTIME"
+    else
+      ret=$?
+      # ret==1 => EOF, ret==142 => timeout
+      [[ -n "${chunk-}" ]] && printf '%s' "$chunk"
+      if [[ $ret -eq 1 ]]; then
+        # EOF
+        break
+      fi
+
+      now="$EPOCHREALTIME"
+      idle=$(awk -v n="$now" -v l="$last_time" 'BEGIN{print n - l}')
+      (( $(awk -v i="$idle" -v s="$IDLE_SECONDS" 'BEGIN{print (i > s)}') )) && break
+    fi
+  fi
+done
+
+exec 3<&-
+
