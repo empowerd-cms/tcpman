@@ -1,6 +1,3 @@
-Here’s a polished, updated README for your `tcpman` that reflects the current FIFO-based Bash client, first_char + JSON messages, path injection, and `best.js` conventions:
-
----
 
 # 🧰 tcpman
 
