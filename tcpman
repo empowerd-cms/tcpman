@@ -1,103 +1,113 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HOSTPORT=""
-DATA="{}"
-IDLE_SECONDS=0.1  # quit if no byte arrives for this many seconds after first byte
+# tcpman_fifo_path_opt.sh
+# Usage:
+#   ./tcpman_fifo_path_opt.sh host:port[/path] 'msg1' 'msg2' ...
+# Example:
+#   ./tcpman_fifo_path_opt.sh localhost:4000/test 'c{creds}' 'q{"action":"ping"}'
 
-# --- Parse args ---
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -d|--data)
-      DATA="$2"
-      shift 2
-      ;;
-    *)
-      HOSTPORT="$1"
-      shift
-      ;;
-  esac
-done
-
-if [[ -z "$HOSTPORT" ]]; then
-  echo "Usage: $0 <tcp://host:port[/path]|host:port[/path]> [-d '<json-data>']" >&2
+URL="$1"
+shift || true
+if [[ -z "$URL" || $# -eq 0 ]]; then
+  echo "Usage: $0 host:port[/path] 'msg1' 'msg2' ..." >&2
   exit 1
 fi
 
-# --- Normalize URL and split optional path ---
-HOSTPORT="${HOSTPORT#tcp://}"
-HOSTPORT_NOPATH="${HOSTPORT%%/*}"
-PATH_PART=""
-if [[ "$HOSTPORT" != "$HOSTPORT_NOPATH" ]]; then
-  PATH_PART="/${HOSTPORT#${HOSTPORT_NOPATH}/}"
-fi
+# --- Extract host, port, optional path ---
+HOSTPORT="${URL%%/*}"             # host:port
+PATH_PART="${URL#${HOSTPORT}}"    # /path or empty
+[[ "$PATH_PART" == "$URL" ]] && PATH_PART=""  # no path
+HOST="${HOSTPORT%%:*}"
+PORT="${HOSTPORT##*:}"
 
-# --- Parse host and port ---
-if [[ "$HOSTPORT_NOPATH" == *:* ]]; then
-  HOST="${HOSTPORT_NOPATH%%:*}"
-  PORT="${HOSTPORT_NOPATH##*:}"
-else
-  echo "Error: please specify host:port" >&2
+if [[ -z "$HOST" || -z "$PORT" ]]; then
+  echo "Error: invalid host:port" >&2
   exit 1
 fi
 
-# --- Validate JSON ---
-command -v jq >/dev/null 2>&1 || { echo "jq required"; exit 1; }
-if ! DATA=$(jq -c . <<<"$DATA" 2>/dev/null); then
-  echo "Error: invalid JSON" >&2
-  exit 1
-fi
+# --- Config ---
+IDLE_SECONDS="${IDLE_TIME:-0.005}"   # idle wait after last byte
+CHUNK_SIZE=4096
+TMPDIR=$(mktemp -d)
+FIFO="$TMPDIR/tcpman.fifo"
+trap 'rc=$?; cleanup; exit $rc' INT TERM EXIT
 
-# --- Inject optional path into JSON ---
-if [[ -n "$PATH_PART" ]]; then
-  if ! jq -e 'has("path")' <<<"$DATA" >/dev/null 2>&1; then
-    DATA=$(jq --arg p "$PATH_PART" '. + {path:$p}' <<<"$DATA")
+cleanup() {
+  if [[ -n "${READER_PID-}" ]]; then
+    kill "${READER_PID}" 2>/dev/null || true
+    wait "${READER_PID}" 2>/dev/null || true
   fi
-fi
+  exec 3>&- 2>/dev/null || true
+  [[ -p "$FIFO" ]] && rm -f "$FIFO"
+  [[ -d "$TMPDIR" ]] && rmdir "$TMPDIR" 2>/dev/null || true
+  unset READER_PID
+}
 
-# --- Open TCP connection ---
-exec 3<>/dev/tcp/"$HOST"/"$PORT"
+# --- Open TCP socket ---
+exec 3<>/dev/tcp/"$HOST"/"$PORT" || { echo "Failed to connect to $HOST:$PORT" >&2; exit 1; }
 
-# Send JSON
-printf '%s' "$DATA" >&3
+# --- FIFO reader ---
+mkfifo "$FIFO"
+( cat <&3 >"$FIFO" ) &
+READER_PID=$!
 
-# --- Read in chunks and monitor idle ---
-first_byte_received=false
-last_time=0
-CHUNK_SIZE=512
+# --- Optional path injection for first_char + JSON messages ---
+inject_path() {
+  local msg="$1"
+  local idx="$2"
+  # Only inject if PATH_PART exists and msg looks like first_char + JSON {…}
+  if [[ -n "$PATH_PART" && "$idx" -gt 1 && "$msg" =~ ^.?\{.*\}$ ]]; then
+    local first_char="${msg:0:1}"
+    local json_content="${msg:1}"   # includes {…}
+    # Only inject if valid JSON and jq exists
+    if command -v jq >/dev/null 2>&1 && jq -e . >/dev/null 2>&1 <<<"$json_content"; then
+      # merge path only if not present
+      json_content=$(jq -c --arg p "/${PATH_PART#/}" 'if has("path") then . else . + {path:$p} end' <<<"$json_content")
+      msg="${first_char}${json_content}"
+    fi
+    # else: leave msg unchanged (raw or invalid JSON)
+  fi
+  printf '%s' "$msg"
+}
 
-while true; do
-  if ! $first_byte_received; then
-    # Wait indefinitely for the first data
-    if IFS= read -r -N "$CHUNK_SIZE" chunk <&3; then
+# --- Send and wait response ---
+send_and_wait_response() {
+  local msg="$1"
+  local i="$2"
+  msg=$(inject_path "$msg" "$i")
+  echo ">>> Sending: $msg" >&2
+  printf '%s\n' "$msg" >&3
+
+  # --- wait for first byte ---
+  local first_char
+  if ! IFS= read -r -n 1 first_char <"$FIFO"; then
+    echo "<<< Connection closed by remote (no first byte)" >&2
+    return 1
+  fi
+  printf '%s' "$first_char"
+
+  # --- read remaining bytes until idle ---
+  local chunk
+  while true; do
+    if IFS= read -r -n "$CHUNK_SIZE" -t "$IDLE_SECONDS" chunk <"$FIFO"; then
       [[ -n "$chunk" ]] && printf '%s' "$chunk"
-      first_byte_received=true
-      last_time="$EPOCHREALTIME"
     else
-      # read failed (EOF) but may have printed partial data
-      [[ -n "$chunk" ]] && printf '%s' "$chunk"
+      printf '\n'
       break
     fi
-  else
-    # Small timeout for idle detection
-    if IFS= read -r -N "$CHUNK_SIZE" -t 0.1 chunk <&3; then
-      [[ -n "$chunk" ]] && printf '%s' "$chunk"
-      last_time="$EPOCHREALTIME"
-    else
-      ret=$?
-      # ret==1 => EOF, ret==142 => timeout
-      [[ -n "${chunk-}" ]] && printf '%s' "$chunk"
-      if [[ $ret -eq 1 ]]; then
-        # EOF
-        break
-      fi
+  done
+}
 
-      now="$EPOCHREALTIME"
-      idle=$(awk -v n="$now" -v l="$last_time" 'BEGIN{print n - l}')
-      (( $(awk -v i="$idle" -v s="$IDLE_SECONDS" 'BEGIN{print (i > s)}') )) && break
-    fi
+# --- Main loop ---
+i=0
+for msg in "$@"; do
+  i=$((i+1))
+  if ! send_and_wait_response "$msg" "$i"; then
+    echo "Stopping due to closed connection." >&2
+    break
   fi
 done
 
-exec 3<&-
+cleanup
 
