@@ -1,7 +1,7 @@
 
 # 🧰 tcpman
 
-**A lightweight, opinionated TCP client for `best.js` servers**.
+**A lightweight, opinionated TCP client for [best.js](https://github.com/empowerd-cms/best.js) servers**.
 Designed for Bash, `tcpman` reliably sends first_char + JSON messages and reads complete responses, even when packets arrive in pieces. Supports optional path injection and keeps every byte intact.
 
 ---

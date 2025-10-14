@@ -27,7 +27,7 @@ if [[ -z "$HOST" || -z "$PORT" ]]; then
 fi
 
 # --- Config ---
-IDLE_SECONDS="${IDLE_TIME:-0.005}"   # idle wait after last byte
+IDLE_SECONDS="${IDLE_TIME:-0.009}"   # idle wait after last byte
 CHUNK_SIZE=4096
 TMPDIR=$(mktemp -d)
 FIFO="$TMPDIR/tcpman.fifo"
